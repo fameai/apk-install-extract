@@ -143,19 +143,18 @@ jobs:
           echo "🚀 Installing APK with MAXIMUM bypass flags..."
           echo "📦 APK: ${{matrix.apkpath}}"
 
-          # SOLUTION 4: Use ALL available bypass flags
+          # SOLUTION 4: Use ALL available bypass flags for Android 11
           # -r: Replace existing application
           # -t: Allow test packages
           # -d: Allow version code downgrade
           # -g: Grant all runtime permissions
-          # --bypass-low-target-sdk-block: Bypass Android 12+ restrictions
+          # Note: --bypass-low-target-sdk-block only available on Android 14+
 
           adb -s ${{env.avd_name}} install \
             -r \
             -t \
             -d \
             -g \
-            --bypass-low-target-sdk-block \
             "${{matrix.apkpath}}"
 
           install_result=$?
