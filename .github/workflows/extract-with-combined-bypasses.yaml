@@ -80,6 +80,46 @@ jobs:
           echo "apkpkgver=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2,$3}' | sed "s/'//g" | sed 's/ /-/g')" >> "$GITHUB_ENV"
           echo "Package: ${{env.apkpkg}}"
 
+      - name: Re-sign APK with debug certificate (FIX SIGNATURE)
+        run: |
+          echo "🔧 Re-signing APK to fix signature verification..."
+
+          # Install apksigner if not present
+          sudo apt-get update -qq
+          sudo apt-get install -y apksigner zipalign
+
+          # Create debug keystore if it doesn't exist
+          if [ ! -f ~/.android/debug.keystore ]; then
+            mkdir -p ~/.android
+            keytool -genkey -v -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey \
+              -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Backup original APK
+          cp "${{matrix.apkpath}}" "${{matrix.apkpath}}.original"
+
+          # Align the APK first (required before signing)
+          zipalign -f -p 4 "${{matrix.apkpath}}.original" "${{matrix.apkpath}}.aligned"
+
+          # Sign with debug certificate (v1, v2, v3 schemes)
+          apksigner sign --ks ~/.android/debug.keystore \
+            --ks-key-alias androiddebugkey \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "${{matrix.apkpath}}.signed" \
+            "${{matrix.apkpath}}.aligned"
+
+          # Replace original with signed version
+          mv "${{matrix.apkpath}}.signed" "${{matrix.apkpath}}"
+
+          # Verify signature
+          apksigner verify -v --print-certs "${{matrix.apkpath}}" && echo "✅ APK re-signed successfully!"
+
       - name: Start reDroid with ALL security bypasses (SOLUTION 3)
         run: |
           mkdir -p data
@@ -242,7 +282,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: libraries-combined-bypass-${{strategy.job-index}}
+          name: libraries-${{github.run_id}}-${{github.run_attempt}}
           path: |
             extracted_libs/
             ${{env.apkpkgver}}-combined-bypass-libs.tar.gz
@@ -252,7 +292,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: data-combined-bypass-${{strategy.job-index}}
+          name: data-debug-${{github.run_id}}-${{github.run_attempt}}
           path: data/data/${{env.apkpkg}}/
           retention-days: 7
 
@@ -268,7 +308,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: logs-combined-bypass-${{strategy.job-index}}
+          name: logs-${{github.run_id}}-${{github.run_attempt}}
           path: logs/
           retention-days: 7
 
