@@ -236,35 +236,56 @@ jobs:
           pkg="${{env.apkpkg}}"
           mkdir -p extracted_libs
 
-          echo "📂 Extracting from /data/data/$pkg/lib..."
-          adb -s ${{env.avd_name}} pull /data/data/$pkg/lib/ extracted_libs/ || true
+          echo "🔍 Checking for SuperPack libraries..."
+          adb -s ${{env.avd_name}} shell "ls -lh /data/data/$pkg/lib-compressed/*.so 2>/dev/null | head -5" || echo "Checking alternative locations..."
+
+          echo "📂 Extracting from /data/data/$pkg/lib-compressed/ (SuperPack location)..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/lib-compressed/ extracted_libs/lib-compressed/ || true
+
+          echo "📂 Extracting from /data/data/$pkg/lib/ (standard location)..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/lib/ extracted_libs/lib/ || true
 
           echo "📂 Extracting from /data/data/$pkg/files..."
           adb -s ${{env.avd_name}} pull /data/data/$pkg/files/ extracted_libs/files/ || true
 
           echo "📋 Listing extracted .so files:"
-          find extracted_libs -type f -name '*.so' -exec ls -lh {} \; || echo "No .so files found"
+          find extracted_libs -type f -name '*.so' -exec ls -lh {} \; | head -20 || echo "No .so files found"
 
-          echo "📊 Total files extracted:"
-          find extracted_libs -type f | wc -l
+          echo "📊 Total .so files extracted:"
+          find extracted_libs -type f -name '*.so' | wc -l
+
+          echo "📊 Total size:"
+          du -sh extracted_libs/
 
       - name: Analyze extracted libraries
         run: |
           echo "🔬 Analyzing extracted libraries for libcoremerged.so..."
 
-          if [ -f "extracted_libs/lib/libcoremerged.so" ]; then
-            echo "✅ FOUND libcoremerged.so!"
-            ls -lh extracted_libs/lib/libcoremerged.so
-            file extracted_libs/lib/libcoremerged.so
+          # Check lib-compressed first (SuperPack location)
+          if [ -f "extracted_libs/lib-compressed/libcoremerged.so" ]; then
+            echo "✅ FOUND libcoremerged.so in lib-compressed/ (SuperPack)!"
+            ls -lh extracted_libs/lib-compressed/libcoremerged.so
+            file extracted_libs/lib-compressed/libcoremerged.so
+
+            echo "📋 File details:"
+            readelf -h extracted_libs/lib-compressed/libcoremerged.so 2>/dev/null || true
 
             echo "📋 Checking for appnetsessionid symbols..."
-            strings extracted_libs/lib/libcoremerged.so | grep -i "nid\|sessionid\|appnet" | head -20 || true
+            strings extracted_libs/lib-compressed/libcoremerged.so | grep -i "nid\|sessionid\|appnet" | head -20 || echo "No strings found (stripped binary)"
+          elif [ -f "extracted_libs/lib/libcoremerged.so" ]; then
+            echo "✅ FOUND libcoremerged.so in lib/ (standard)!"
+            ls -lh extracted_libs/lib/libcoremerged.so
+            file extracted_libs/lib/libcoremerged.so
           else
-            echo "❌ libcoremerged.so not found"
+            echo "❌ libcoremerged.so not found in any location"
           fi
 
-          echo "📋 All extracted libraries:"
-          find extracted_libs -name '*.so' -ls
+          echo ""
+          echo "📋 Summary of all extracted .so files:"
+          find extracted_libs -name '*.so' -type f | wc -l
+          echo ""
+          echo "📋 Top 10 largest libraries:"
+          find extracted_libs -name '*.so' -type f -exec ls -lh {} \; | sort -k5 -hr | head -10
 
       - name: Fix permissions
         if: always()
