@@ -257,14 +257,21 @@ jobs:
           path: data/data/${{env.apkpkg}}/
           retention-days: 7
 
-      - name: Upload logs
-        uses: actions/upload-artifact@v4
+      - name: Collect logs
         if: always()
         run: |
           mkdir -p logs
           adb -s ${{env.avd_name}} logcat -d > logs/logcat.txt || true
           adb -s ${{env.avd_name}} shell dmesg > logs/dmesg.txt || true
         continue-on-error: true
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-combined-bypass-${{strategy.job-index}}
+          path: logs/
+          retention-days: 7
 
       - name: Final status report
         if: always()
