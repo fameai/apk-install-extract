@@ -90,15 +90,26 @@ jobs:
         
 
       - name: adb connect install
-        run: |                    
+        run: |
           adb connect ${{env.avd_name}}
-          adb devices -l 
-          adb -s ${{env.avd_name}} install --abi ${{matrix.arch}} "${{matrix.apkpath}}"
+          adb devices -l
+          echo "Waiting for device to be ready..."
+          adb -s ${{env.avd_name}} wait-for-device
+          sleep 10
+          # Use smart installer that handles both single and split APKs
+          ./adb-install-smart.sh "${{env.avd_name}}" "${{matrix.arch}}" "${{matrix.apkpath}}"
           
       - name: adb start main activity
-        run: |                    
-          # adb -s localhost:5555 shell am start -n com.whatsapp/com.whatsapp.Main          
+        run: |
+          echo "Launching app to trigger SuperPack decompression..."
           ./adb-run.sh "${{matrix.apkpath}}"
+
+      - name: wait for SuperPack decompression
+        run: |
+          echo "Waiting 90 seconds for SuperPack libraries to decompress..."
+          sleep 90
+          echo "Checking for decompressed libraries..."
+          adb -s ${{env.avd_name}} shell "find /data/data/*/lib -name '*.so' 2>/dev/null | head -20" || true
 
       - name: get package name ver
         run : |
