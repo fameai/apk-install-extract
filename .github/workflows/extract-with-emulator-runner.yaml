@@ -1,0 +1,156 @@
+name: Extract with Android Emulator Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_zip_url:
+        description: 'URL to download APK zip file'
+        required: true
+        type: string
+        default: https://github.com/fameai/apk-install-extract/releases/download/v1.0-instagram/Instagram_403_merged.zip
+      run_name:
+        description: 'Custom run name'
+        required: false
+        type: string
+
+env:
+  all_apk_dir: all_apks
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and extract APKs
+        run: |
+          mkdir ${{env.all_apk_dir}}
+          wget ${{inputs.apk_zip_url}} -O ${{env.all_apk_dir}}.zip
+          unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
+          find ${{env.all_apk_dir}} -name "*.apk"
+
+      - name: Setup paths
+        id: getpaths
+        run: |
+          # Only include base APKs (exclude config.*.apk)
+          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk") if "config." not in file.name and "split" not in file.name])')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+  extract-libraries:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
+        api-level: [29]  # Android 10 - best stability
+        arch: [x86_64]   # x86_64 for speed, add arm64-v8a if needed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable KVM (hardware acceleration)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+      - name: Get package info
+        run: |
+          sudo apt-get install -y aapt
+          echo "apkpkg=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2}' | awk -F"'" '/name=/ {print $2}')" >> "$GITHUB_ENV"
+          echo "apkpkgver=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2,$3}' | sed "s/'//g" | sed 's/ /-/g')" >> "$GITHUB_ENV"
+
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ matrix.api-level }}-${{ matrix.arch }}
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: ${{ matrix.arch }}
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: Run emulator and extract libraries
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: ${{ matrix.arch }}
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            echo "Installing APK..."
+            adb install -r -t "${{matrix.apkpath}}"
+
+            echo "Getting package name..."
+            pkg="${{env.apkpkg}}"
+            echo "Package: $pkg"
+
+            echo "Launching app to trigger SuperPack decompression..."
+            adb shell am start -n $pkg/com.instagram.android.activity.MainTabActivity || \
+            adb shell monkey -p $pkg -c android.intent.category.LAUNCHER 1
+
+            echo "Waiting 120 seconds for SuperPack decompression..."
+            sleep 120
+
+            echo "Checking for decompressed libraries..."
+            adb shell "find /data/data/$pkg -name '*.so' 2>/dev/null | head -20" || true
+
+            echo "Creating output directory..."
+            mkdir -p extracted_libs_${{matrix.arch}}
+
+            echo "Extracting libraries..."
+            adb pull /data/data/$pkg/lib/ extracted_libs_${{matrix.arch}}/ || true
+            adb pull /data/data/$pkg/files/ extracted_libs_${{matrix.arch}}/files/ || true
+
+            echo "Listing extracted files..."
+            find extracted_libs_${{matrix.arch}} -name '*.so' -ls || true
+
+            echo "Creating archive..."
+            tar czf ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz extracted_libs_${{matrix.arch}}/
+
+      - name: Upload extracted libraries
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libraries-${{matrix.arch}}-${{strategy.job-index}}
+          path: |
+            extracted_libs_${{matrix.arch}}/
+            ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz
+          retention-days: 30
+
+      - name: Upload library archive
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: archive-${{matrix.arch}}-${{strategy.job-index}}
+          path: ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz
+          retention-days: 90

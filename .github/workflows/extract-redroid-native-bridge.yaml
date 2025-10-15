@@ -1,0 +1,188 @@
+name: Extract with reDroid Native Bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_zip_url:
+        description: 'URL to download APK zip file'
+        required: true
+        type: string
+        default: https://github.com/fameai/apk-install-extract/releases/download/v1.0-instagram/Instagram_403_merged.zip
+      run_name:
+        description: 'Custom run name'
+        required: false
+        type: string
+
+env:
+  avd_port: 9999
+  avd_name: localhost:9999
+  all_apk_dir: all_apks
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and extract APKs
+        run: |
+          mkdir ${{env.all_apk_dir}}
+          wget ${{inputs.apk_zip_url}} -O ${{env.all_apk_dir}}.zip
+          unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
+          find ${{env.all_apk_dir}} -name "*.apk"
+
+      - name: Setup paths
+        id: getpaths
+        run: |
+          # Only include base APKs (exclude config.*.apk)
+          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk") if "config." not in file.name and "split" not in file.name])')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+  extract-with-native-bridge:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
+        arch: ['armeabi-v7a', 'arm64-v8a']  # ARM architectures (Instagram is ARM-only)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ADB and AAPT
+        run: |
+          sudo apt install -y adb aapt
+
+      - name: Install reDroid dependencies
+        run: |
+          ## Install required kernel modules
+          sudo apt install -y linux-modules-extra-`uname -r`
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+      - name: Start reDroid with Native Bridge (Android 11)
+        run: |
+          mkdir -p data
+          echo "Starting reDroid with ARM translation support..."
+
+          docker run -itd --rm --privileged --pull always \
+            -v $(pwd)/data:/data \
+            -p ${{env.avd_port}}:5555 \
+            redroid/redroid:11.0.0-latest \
+            androidboot.redroid_gpu_mode=guest \
+            ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi \
+            ro.product.cpu.abilist64=x86_64,arm64-v8a \
+            ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi \
+            ro.dalvik.vm.isa.arm=x86 \
+            ro.dalvik.vm.isa.arm64=x86_64 \
+            ro.enable.native.bridge.exec=1 \
+            ro.dalvik.vm.native.bridge=libndk_translation.so \
+            ro.ndk_translation.version=0.2.2
+
+          echo "Waiting for Android to boot..."
+          sleep 30
+
+      - name: Wait for device and disable verification
+        run: |
+          echo "Connecting to emulator..."
+          adb connect ${{env.avd_name}}
+          adb devices -l
+
+          echo "Waiting for boot completion..."
+          adb -s ${{env.avd_name}} wait-for-device
+          timeout 60 adb -s ${{env.avd_name}} shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done' || true
+
+          echo "Disabling APK verification..."
+          adb -s ${{env.avd_name}} shell settings put global verifier_verify_adb_installs 0 || true
+          adb -s ${{env.avd_name}} shell settings put global package_verifier_enable 0 || true
+
+      - name: Install APK with permissions
+        run: |
+          echo "Installing APK: ${{matrix.apkpath}}"
+          echo "Architecture filter: ${{matrix.arch}}"
+
+          # Install with all flags for maximum compatibility
+          adb -s ${{env.avd_name}} install -r -g -t --abi ${{matrix.arch}} "${{matrix.apkpath}}"
+
+      - name: Get package info
+        run: |
+          echo "apkpkg=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2}' | awk -F"'" '/name=/ {print $2}')" >> "$GITHUB_ENV"
+          echo "apkpkgver=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2,$3}' | sed "s/'//g" | sed 's/ /-/g')" >> "$GITHUB_ENV"
+          echo "Package: ${{env.apkpkg}}"
+
+      - name: Launch app
+        run: |
+          echo "Launching Instagram..."
+          pkg="${{env.apkpkg}}"
+
+          # Try multiple launch methods
+          adb -s ${{env.avd_name}} shell am start -n $pkg/com.instagram.android.activity.MainTabActivity || \
+          adb -s ${{env.avd_name}} shell monkey -p $pkg -c android.intent.category.LAUNCHER 1 || \
+          echo "App launch may have failed, continuing anyway..."
+
+      - name: Wait for SuperPack decompression
+        run: |
+          echo "Waiting 120 seconds for SuperPack libraries to decompress..."
+          sleep 120
+
+          echo "Checking for decompressed libraries..."
+          adb -s ${{env.avd_name}} shell "find /data/data/${{env.apkpkg}} -name '*.so' 2>/dev/null | head -20" || true
+
+      - name: Extract libraries
+        run: |
+          pkg="${{env.apkpkg}}"
+          mkdir -p extracted_libs_${{matrix.arch}}
+
+          echo "Extracting from /data/data/$pkg/lib..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/lib/ extracted_libs_${{matrix.arch}}/ || true
+
+          echo "Extracting from /data/data/$pkg/files..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/files/ extracted_libs_${{matrix.arch}}/files/ || true
+
+          echo "Listing extracted files..."
+          find extracted_libs_${{matrix.arch}} -type f -name '*.so' -ls || echo "No .so files found"
+
+      - name: Fix permissions
+        if: always()
+        run: |
+          docker stop $(docker ps -a -q) || true
+          sudo chown -R runner:runner data || true
+          sudo chown -R runner:runner extracted_libs_${{matrix.arch}} || true
+
+      - name: Create archive
+        run: |
+          tar czf ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz extracted_libs_${{matrix.arch}}/
+          ls -lh ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz
+
+      - name: Upload extracted libraries
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libraries-${{matrix.arch}}-${{strategy.job-index}}
+          path: |
+            extracted_libs_${{matrix.arch}}/
+            ${{env.apkpkgver}}-${{matrix.arch}}-libs.tar.gz
+          retention-days: 30
+
+      - name: Upload data directory
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data-${{matrix.arch}}-${{strategy.job-index}}
+          path: data/data/${{env.apkpkg}}/
+          retention-days: 7
