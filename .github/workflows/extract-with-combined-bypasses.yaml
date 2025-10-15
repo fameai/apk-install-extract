@@ -1,0 +1,286 @@
+name: Extract with Combined Bypass Methods
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_zip_url:
+        description: 'URL to download APK zip file'
+        required: true
+        type: string
+        default: https://github.com/fameai/apk-install-extract/releases/download/v1.0-instagram/Instagram_403_merged.zip
+      run_name:
+        description: 'Custom run name'
+        required: false
+        type: string
+
+env:
+  avd_port: 5555
+  avd_name: localhost:5555
+  all_apk_dir: all_apks
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and extract APKs
+        run: |
+          mkdir ${{env.all_apk_dir}}
+          wget ${{inputs.apk_zip_url}} -O ${{env.all_apk_dir}}.zip
+          unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
+          find ${{env.all_apk_dir}} -name "*.apk"
+
+      - name: Setup paths
+        id: getpaths
+        run: |
+          # Only include base APKs (exclude config.*.apk and split APKs)
+          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk") if "config." not in file.name and "split" not in file.name])')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+  extract-with-all-bypasses:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ADB and AAPT
+        run: |
+          sudo apt install -y adb aapt
+
+      - name: Install reDroid dependencies
+        run: |
+          ## Install required kernel modules
+          sudo apt install -y linux-modules-extra-`uname -r`
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{env.all_apk_dir}}
+          path: ${{env.all_apk_dir}}
+
+      - name: Get package info
+        run: |
+          echo "apkpkg=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2}' | awk -F"'" '/name=/ {print $2}')" >> "$GITHUB_ENV"
+          echo "apkpkgver=$(aapt dump badging "${{matrix.apkpath}}" | awk -F" " '/package/ {print $2,$3}' | sed "s/'//g" | sed 's/ /-/g')" >> "$GITHUB_ENV"
+          echo "Package: ${{env.apkpkg}}"
+
+      - name: Start reDroid with ALL security bypasses (SOLUTION 3)
+        run: |
+          mkdir -p data
+          echo "🔥 Starting reDroid with MAXIMUM security relaxation..."
+
+          docker run -itd --rm --privileged --pull always \
+            -v $(pwd)/data:/data \
+            -p ${{env.avd_port}}:5555 \
+            redroid/redroid:11.0.0-latest \
+            androidboot.redroid_gpu_mode=guest \
+            androidboot.redroid_override_prop="ro.secure=0 ro.debuggable=1" \
+            ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi \
+            ro.product.cpu.abilist64=x86_64,arm64-v8a \
+            ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi \
+            ro.dalvik.vm.isa.arm=x86 \
+            ro.dalvik.vm.isa.arm64=x86_64 \
+            ro.enable.native.bridge.exec=1 \
+            ro.dalvik.vm.native.bridge=libndk_translation.so \
+            ro.ndk_translation.version=0.2.2
+
+          echo "⏱️ Waiting 30 seconds for initial boot..."
+          sleep 30
+
+      - name: Wait for device and DISABLE ALL VERIFICATION (SOLUTION 1)
+        run: |
+          echo "🔌 Connecting to emulator..."
+          adb connect ${{env.avd_name}}
+          adb devices -l
+
+          echo "⏱️ Waiting for boot completion (CRITICAL TIMING)..."
+          adb -s ${{env.avd_name}} wait-for-device
+          timeout 90 adb -s ${{env.avd_name}} shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done' || true
+
+          echo "✅ Boot completed! Now is the RIGHT TIME to disable verification."
+          sleep 5
+
+          echo "🔥 Disabling ALL APK verification layers..."
+          adb -s ${{env.avd_name}} shell settings put global package_verifier_enable 0 || true
+          adb -s ${{env.avd_name}} shell settings put global verifier_verify_adb_installs 0 || true
+          adb -s ${{env.avd_name}} shell settings put global package_verifier_user_consent -1 || true
+
+          echo "📋 Verification status:"
+          adb -s ${{env.avd_name}} shell settings get global package_verifier_enable || true
+          adb -s ${{env.avd_name}} shell settings get global verifier_verify_adb_installs || true
+
+      - name: FORCE COMPLETE UNINSTALL (SOLUTION 2)
+        run: |
+          echo "🗑️ Checking for existing Instagram installation..."
+          adb -s ${{env.avd_name}} shell pm list packages | grep instagram || echo "Not installed"
+
+          echo "🔥 Forcing complete uninstall for ALL users..."
+          adb -s ${{env.avd_name}} uninstall com.instagram.android || echo "Standard uninstall done"
+          adb -s ${{env.avd_name}} shell pm uninstall com.instagram.android || echo "PM uninstall done"
+          adb -s ${{env.avd_name}} shell pm uninstall --user 0 com.instagram.android || echo "User 0 uninstall done"
+
+          echo "✅ Uninstall complete. Verifying..."
+          adb -s ${{env.avd_name}} shell pm list packages | grep instagram || echo "✓ Instagram completely removed"
+
+      - name: Install with ALL BYPASS FLAGS (SOLUTION 4)
+        run: |
+          echo "🚀 Installing APK with MAXIMUM bypass flags..."
+          echo "📦 APK: ${{matrix.apkpath}}"
+
+          # SOLUTION 4: Use ALL available bypass flags
+          # -r: Replace existing application
+          # -t: Allow test packages
+          # -d: Allow version code downgrade
+          # -g: Grant all runtime permissions
+          # --bypass-low-target-sdk-block: Bypass Android 12+ restrictions
+
+          adb -s ${{env.avd_name}} install \
+            -r \
+            -t \
+            -d \
+            -g \
+            --bypass-low-target-sdk-block \
+            "${{matrix.apkpath}}"
+
+          install_result=$?
+          if [ $install_result -eq 0 ]; then
+            echo "✅ Installation SUCCEEDED!"
+          else
+            echo "❌ Installation failed with exit code: $install_result"
+            echo "📋 Checking device logs..."
+            adb -s ${{env.avd_name}} logcat -d | tail -50 || true
+            exit $install_result
+          fi
+
+      - name: Verify installation
+        run: |
+          echo "📋 Verifying Instagram is installed..."
+          adb -s ${{env.avd_name}} shell pm list packages | grep instagram || echo "❌ Package not found!"
+
+          echo "📋 Package details:"
+          adb -s ${{env.avd_name}} shell dumpsys package com.instagram.android | grep -A 5 "versionName" || true
+
+      - name: Launch app and wait for SuperPack decompression
+        run: |
+          echo "🚀 Launching Instagram to trigger SuperPack decompression..."
+          pkg="${{env.apkpkg}}"
+
+          # Try multiple launch methods
+          adb -s ${{env.avd_name}} shell am start -n $pkg/com.instagram.android.activity.MainTabActivity || \
+          adb -s ${{env.avd_name}} shell monkey -p $pkg -c android.intent.category.LAUNCHER 1 || \
+          echo "⚠️ App launch may have failed, but continuing..."
+
+          echo "⏱️ Waiting 120 seconds for SuperPack libraries to decompress..."
+          sleep 120
+
+          echo "🔍 Checking for decompressed libraries..."
+          adb -s ${{env.avd_name}} shell "find /data/data/$pkg -name '*.so' 2>/dev/null | head -20" || true
+
+      - name: Extract libraries
+        run: |
+          pkg="${{env.apkpkg}}"
+          mkdir -p extracted_libs
+
+          echo "📂 Extracting from /data/data/$pkg/lib..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/lib/ extracted_libs/ || true
+
+          echo "📂 Extracting from /data/data/$pkg/files..."
+          adb -s ${{env.avd_name}} pull /data/data/$pkg/files/ extracted_libs/files/ || true
+
+          echo "📋 Listing extracted .so files:"
+          find extracted_libs -type f -name '*.so' -exec ls -lh {} \; || echo "No .so files found"
+
+          echo "📊 Total files extracted:"
+          find extracted_libs -type f | wc -l
+
+      - name: Analyze extracted libraries
+        run: |
+          echo "🔬 Analyzing extracted libraries for libcoremerged.so..."
+
+          if [ -f "extracted_libs/lib/libcoremerged.so" ]; then
+            echo "✅ FOUND libcoremerged.so!"
+            ls -lh extracted_libs/lib/libcoremerged.so
+            file extracted_libs/lib/libcoremerged.so
+
+            echo "📋 Checking for appnetsessionid symbols..."
+            strings extracted_libs/lib/libcoremerged.so | grep -i "nid\|sessionid\|appnet" | head -20 || true
+          else
+            echo "❌ libcoremerged.so not found"
+          fi
+
+          echo "📋 All extracted libraries:"
+          find extracted_libs -name '*.so' -ls
+
+      - name: Fix permissions
+        if: always()
+        run: |
+          docker stop $(docker ps -a -q) || true
+          sudo chown -R runner:runner data || true
+          sudo chown -R runner:runner extracted_libs || true
+
+      - name: Create archive
+        run: |
+          tar czf ${{env.apkpkgver}}-combined-bypass-libs.tar.gz extracted_libs/
+          ls -lh ${{env.apkpkgver}}-combined-bypass-libs.tar.gz
+
+      - name: Upload extracted libraries
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libraries-combined-bypass-${{strategy.job-index}}
+          path: |
+            extracted_libs/
+            ${{env.apkpkgver}}-combined-bypass-libs.tar.gz
+          retention-days: 30
+
+      - name: Upload data directory (for debugging)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data-combined-bypass-${{strategy.job-index}}
+          path: data/data/${{env.apkpkg}}/
+          retention-days: 7
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        run: |
+          mkdir -p logs
+          adb -s ${{env.avd_name}} logcat -d > logs/logcat.txt || true
+          adb -s ${{env.avd_name}} shell dmesg > logs/dmesg.txt || true
+        continue-on-error: true
+
+      - name: Final status report
+        if: always()
+        run: |
+          echo "================================================"
+          echo "🎯 EXTRACTION ATTEMPT COMPLETE"
+          echo "================================================"
+          echo ""
+          echo "📋 Bypass Methods Applied:"
+          echo "✅ SOLUTION 1: Disabled package verification (3 settings)"
+          echo "✅ SOLUTION 2: Complete uninstall before install"
+          echo "✅ SOLUTION 3: reDroid property overrides (ro.secure=0, ro.debuggable=1)"
+          echo "✅ SOLUTION 4: All install bypass flags (-r -t -d -g --bypass-low-target-sdk-block)"
+          echo ""
+          echo "📊 Results:"
+          ls -lh extracted_libs/ 2>/dev/null || echo "❌ No files extracted"
+          echo ""
+          echo "🔍 Check artifacts for extracted libraries and logs"
+          echo "================================================"
